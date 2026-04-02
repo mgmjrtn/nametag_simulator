@@ -10,9 +10,10 @@ from typing import Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Nametag Simulator", version="1.0.0")
+app = FastAPI(title="Nametag Simulator", version="1.0.1")
 
 SIMULATOR_SECRET = os.getenv("SIMULATOR_SECRET", "change-me-in-render")
 SIMULATOR_BASE_URL = os.getenv("SIMULATOR_BASE_URL", "http://localhost:8000")
@@ -103,7 +104,11 @@ def create_request(body: CreateRequestBody):
     requests_store[request_id] = rec
 
     if AUTO_COMPLETE_SECONDS > 0 and rec["webhook_target_url"]:
-        threading.Thread(target=_auto_complete_later, args=(request_id, AUTO_COMPLETE_SECONDS), daemon=True).start()
+        threading.Thread(
+            target=_auto_complete_later,
+            args=(request_id, AUTO_COMPLETE_SECONDS),
+            daemon=True,
+        ).start()
 
     return {
         "id": rec["id"],
@@ -125,39 +130,68 @@ def get_request(request_id: str):
     return rec
 
 
-@app.get("/verify/{request_id}")
+@app.get("/verify/{request_id}", response_class=HTMLResponse)
 def verify_page(request_id: str):
     rec = requests_store.get(request_id)
     if not rec:
-        raise HTTPException(status_code=404, detail="Request not found")
+        return HTMLResponse("<h3>Request not found.</h3>", status_code=404)
 
-    if not rec.get("webhook_target_url"):
-        raise HTTPException(status_code=400, detail="No webhook target configured on the request or service")
+    if rec.get("completed_at"):
+        html = f"""
+        <html>
+          <head><title>Nametag Simulator</title></head>
+          <body style="font-family: Arial, sans-serif; padding: 40px;">
+            <h2>Nametag Simulator</h2>
+            <p>Request <b>{request_id}</b> was already completed.</p>
+            <p>Subject: <b>{rec['subject']}</b></p>
+            <p>Webhook sent: <b>{str(rec.get('webhook_sent', False)).lower()}</b></p>
+          </body>
+        </html>
+        """
+        return HTMLResponse(html, status_code=200)
 
-    if not rec.get("webhook_sent"):
-        complete_result = complete_request(request_id, CompleteRequestBody())
-        return {
-            "ok": True,
-            "message": "Verification completed and webhook sent.",
-            "request_id": request_id,
-            "subject": rec["subject"],
-            "webhook_result": complete_result,
-        }
+    html = f"""
+    <html>
+      <head>
+        <title>Nametag Simulator Verify</title>
+      </head>
+      <body style="font-family: Arial, sans-serif; padding: 40px;">
+        <h2>Nametag Simulator</h2>
+        <p>Request <b>{request_id}</b> is ready for verification.</p>
+        <p>Subject: <b>{rec['subject']}</b></p>
+        <p>Claims requested: <b>{", ".join(rec["claims"])}</b></p>
 
-    return {
-        "ok": True,
-        "message": "Verification was already completed earlier.",
-        "request_id": request_id,
-        "subject": rec["subject"],
-        "webhook_sent": rec.get("webhook_sent", False),
-    }
+        <form method="post" action="/simulator/complete/{request_id}">
+          <button type="submit" style="padding: 12px 20px; font-size: 16px; cursor: pointer;">
+            Complete Verification
+          </button>
+        </form>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html, status_code=200)
 
 
-@app.post("/simulator/complete/{request_id}")
-def complete_request(request_id: str, body: CompleteRequestBody):
+@app.post("/simulator/complete/{request_id}", response_class=HTMLResponse)
+def complete_request(request_id: str, body: Optional[CompleteRequestBody] = None):
     rec = requests_store.get(request_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Request not found")
+
+    if rec.get("webhook_sent"):
+        html = f"""
+        <html>
+          <head><title>Nametag Simulator</title></head>
+          <body style="font-family: Arial, sans-serif; padding: 40px;">
+            <h2>Nametag Simulator</h2>
+            <p>Request <b>{request_id}</b> was already completed earlier.</p>
+            <p>Subject: <b>{rec['subject']}</b></p>
+          </body>
+        </html>
+        """
+        return HTMLResponse(html, status_code=200)
+
+    body = body or CompleteRequestBody()
 
     if body.result:
         rec["result"] = body.result
@@ -199,16 +233,19 @@ def complete_request(request_id: str, body: CompleteRequestBody):
     rec["status"] = 200 if rec["result"] == "success" else 403
     rec["completed_at"] = utc_now_iso()
 
-    return {
-        "ok": True,
-        "request_id": request_id,
-        "webhook_target_url": rec["webhook_target_url"],
-        "webhook_status_code": response.status_code,
-        "webhook_response_text": response.text,
-        "signature_used": signature,
-        "webhook_id": webhook_id,
-        "payload": payload,
-    }
+    html = f"""
+    <html>
+      <head><title>Nametag Simulator</title></head>
+      <body style="font-family: Arial, sans-serif; padding: 40px;">
+        <h2>Verification Complete</h2>
+        <p>Request <b>{request_id}</b> was completed successfully.</p>
+        <p>Subject: <b>{rec['subject']}</b></p>
+        <p>Webhook target: <b>{rec['webhook_target_url']}</b></p>
+        <p>Webhook status code: <b>{response.status_code}</b></p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html, status_code=200)
 
 
 @app.get("/people/{subject}/properties/{claims}")
@@ -219,6 +256,7 @@ def get_properties(subject: str, claims: str):
         if rec["subject"] == subject:
             matching = rec
             break
+
     if not matching:
         raise HTTPException(status_code=404, detail="Subject not found")
 
