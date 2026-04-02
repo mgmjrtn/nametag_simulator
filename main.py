@@ -10,9 +10,10 @@ from typing import Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Nametag Simulator", version="1.1.0")
+app = FastAPI(title="Nametag Simulator", version="1.2.0")
 
 SIMULATOR_SECRET = os.getenv("SIMULATOR_SECRET", "change-me-in-render")
 SIMULATOR_BASE_URL = os.getenv("SIMULATOR_BASE_URL", "http://localhost:8000")
@@ -107,6 +108,148 @@ def build_properties_for_request(rec: dict) -> List[dict]:
     return properties
 
 
+def render_verify_html(rec: dict) -> str:
+    already_completed = rec.get("webhook_sent", False)
+    completed_text = ""
+    if already_completed:
+        completed_text = """
+        <div class="done-banner">
+          This verification was already completed earlier.
+        </div>
+        """
+
+    disabled_attr = "disabled" if already_completed else ""
+
+    return f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Nametag Simulator Verification</title>
+        <style>
+          body {{
+            font-family: Arial, sans-serif;
+            max-width: 720px;
+            margin: 40px auto;
+            padding: 20px;
+            line-height: 1.5;
+            background: #f7f7f9;
+          }}
+          .card {{
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+          }}
+          h2 {{
+            margin-top: 0;
+          }}
+          .meta {{
+            margin: 6px 0;
+          }}
+          .button-row {{
+            margin-top: 22px;
+          }}
+          button {{
+            background: #0a66c2;
+            color: white;
+            border: none;
+            padding: 12px 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 12px;
+          }}
+          button.secondary {{
+            background: #b42318;
+          }}
+          button:disabled {{
+            background: #999;
+            cursor: not-allowed;
+          }}
+          #status {{
+            margin-top: 20px;
+            font-weight: bold;
+            white-space: pre-wrap;
+          }}
+          .done-banner {{
+            background: #ecfdf3;
+            border: 1px solid #a6f4c5;
+            color: #067647;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 18px;
+          }}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>Nametag Simulator</h2>
+          {completed_text}
+          <div class="meta"><strong>Request ID:</strong> {rec["id"]}</div>
+          <div class="meta"><strong>Subject:</strong> {rec["subject"]}</div>
+          <div class="meta"><strong>Label:</strong> {rec["label"]}</div>
+          <div class="meta"><strong>Claims:</strong> {", ".join(rec["claims"])}</div>
+          <div class="meta"><strong>Current result mode:</strong> {rec["result"]}</div>
+
+          <p>This page now waits for an explicit button click before sending the Nametag webhook.</p>
+
+          <div class="button-row">
+            <button id="successBtn" onclick="completeVerification('success')" {disabled_attr}>
+              Complete Verification
+            </button>
+            <button id="failBtn" class="secondary" onclick="completeVerification('fail')" {disabled_attr}>
+              Fail Verification
+            </button>
+          </div>
+
+          <div id="status"></div>
+        </div>
+
+        <script>
+          async function completeVerification(resultValue) {{
+            const status = document.getElementById('status');
+            const successBtn = document.getElementById('successBtn');
+            const failBtn = document.getElementById('failBtn');
+
+            successBtn.disabled = true;
+            failBtn.disabled = true;
+            status.innerText = 'Submitting ' + resultValue + ' result...';
+
+            try {{
+              const res = await fetch('/simulator/complete/{rec["id"]}', {{
+                method: 'POST',
+                headers: {{
+                  'Content-Type': 'application/json'
+                }},
+                body: JSON.stringify({{ result: resultValue }})
+              }});
+
+              const data = await res.json();
+
+              if (res.ok) {{
+                status.innerText =
+                  'Done. Webhook sent.\\n' +
+                  'HTTP status: ' + data.webhook_status_code + '\\n' +
+                  'Request result: ' + data.payload.result;
+              }} else {{
+                status.innerText = 'Error: ' + JSON.stringify(data, null, 2);
+                successBtn.disabled = false;
+                failBtn.disabled = false;
+              }}
+            }} catch (err) {{
+              status.innerText = 'Error: ' + err;
+              successBtn.disabled = false;
+              failBtn.disabled = false;
+            }}
+          }}
+        </script>
+      </body>
+    </html>
+    """
+
+
 @app.get("/")
 def root():
     return {
@@ -125,6 +268,7 @@ def health():
 def create_request(body: CreateRequestBody):
     request_id = f"req_{secrets.token_hex(4)}"
     subject = body.subject_hint or f"demo-user-{secrets.token_hex(3)}@demo.nametag.co"
+
     rec = {
         "id": request_id,
         "env": body.env,
@@ -142,7 +286,11 @@ def create_request(body: CreateRequestBody):
     requests_store[request_id] = rec
 
     if AUTO_COMPLETE_SECONDS > 0 and rec["webhook_target_url"]:
-        threading.Thread(target=_auto_complete_later, args=(request_id, AUTO_COMPLETE_SECONDS), daemon=True).start()
+        threading.Thread(
+            target=_auto_complete_later,
+            args=(request_id, AUTO_COMPLETE_SECONDS),
+            daemon=True,
+        ).start()
 
     return {
         "id": rec["id"],
@@ -164,32 +312,19 @@ def get_request(request_id: str):
     return rec
 
 
-@app.get("/verify/{request_id}")
+@app.get("/verify/{request_id}", response_class=HTMLResponse)
 def verify_page(request_id: str):
     rec = requests_store.get(request_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Request not found")
 
     if not rec.get("webhook_target_url"):
-        raise HTTPException(status_code=400, detail="No webhook target configured on the request or service")
+        raise HTTPException(
+            status_code=400,
+            detail="No webhook target configured on the request or service",
+        )
 
-    if not rec.get("webhook_sent"):
-        complete_result = complete_request(request_id, CompleteRequestBody())
-        return {
-            "ok": True,
-            "message": "Verification completed and webhook sent.",
-            "request_id": request_id,
-            "subject": rec["subject"],
-            "webhook_result": complete_result,
-        }
-
-    return {
-        "ok": True,
-        "message": "Verification was already completed earlier.",
-        "request_id": request_id,
-        "subject": rec["subject"],
-        "webhook_sent": rec.get("webhook_sent", False),
-    }
+    return HTMLResponse(content=render_verify_html(rec))
 
 
 @app.post("/simulator/complete/{request_id}")
@@ -198,13 +333,26 @@ def complete_request(request_id: str, body: CompleteRequestBody):
     if not rec:
         raise HTTPException(status_code=404, detail="Request not found")
 
+    if rec.get("webhook_sent"):
+        return {
+            "ok": True,
+            "already_completed": True,
+            "request_id": request_id,
+            "webhook_target_url": rec.get("webhook_target_url"),
+            "status": rec.get("status"),
+            "completed_at": rec.get("completed_at"),
+        }
+
     if body.result:
         rec["result"] = body.result
     if body.webhook_target_url:
         rec["webhook_target_url"] = body.webhook_target_url
 
     if not rec["webhook_target_url"]:
-        raise HTTPException(status_code=400, detail="No webhook target configured on the request or service")
+        raise HTTPException(
+            status_code=400,
+            detail="No webhook target configured on the request or service",
+        )
 
     payload = {
         "event_type": "share",
@@ -254,10 +402,12 @@ def complete_request(request_id: str, body: CompleteRequestBody):
 def get_properties(subject: str, claims: str):
     claim_list = [item.strip() for item in claims.split(",") if item.strip()]
     matching = None
+
     for rec in requests_store.values():
         if rec["subject"] == subject:
             matching = rec
             break
+
     if not matching:
         raise HTTPException(status_code=404, detail="Subject not found")
 
@@ -338,8 +488,10 @@ def delete_chat_session(user_phone: str):
 def _auto_complete_later(request_id: str, seconds: int):
     time.sleep(seconds)
     rec = requests_store.get(request_id)
+
     if not rec or not rec.get("webhook_target_url") or rec.get("webhook_sent"):
         return
+
     try:
         complete_request(request_id, CompleteRequestBody())
     except Exception:
